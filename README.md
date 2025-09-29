@@ -2,6 +2,10 @@
 
 This is an updated version of the Deep Ungroup extension that works with Inkscape 1.4 and higher. The extension allows you to recursively ungroup all groups in selected objects or the entire document, with fine-grained control over the ungrouping depth.
 
+## Inspiration
+
+This extension is inspired by and based on the original work by **mcepl** in the `ungroup-deep` extension. The original extension provided the core concept and functionality for recursive ungrouping in Inkscape. This version has been modernized and updated to work with current Inkscape versions while maintaining the powerful features of the original implementation.
+
 ## Features
 
 - **Recursive ungrouping**: Ungroups nested groups to any desired depth

@@ -14,6 +14,6 @@
 		</effects-menu>
 	</effect>
 	<script>
-		<command location="inx" interpreter="python">ungroup_deep.py</command>
+		<command location="inx" interpreter="python">deep_ungroup.py</command>
 	</script>
 </inkscape-extension>

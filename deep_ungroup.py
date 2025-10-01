@@ -3,12 +3,14 @@
 """
 Deep Ungroup extension for Inkscape 1.4+
 Updated for modern Inkscape extension API
+Compatible with headless mode
 """
 
 __version__ = "1.0"  # Updated for Inkscape 1.4+
 
 import inkex
 from inkex import Transform, Style
+import sys
 
 
 class DeepUngroup(inkex.EffectExtension):
@@ -23,148 +25,212 @@ class DeepUngroup(inkex.EffectExtension):
         pars.add_argument("--keepdepth", type=int, default=0,
                          help="levels of ungrouping to leave untouched")
 
+    def _validate_arguments(self):
+        """Validate command line arguments for headless compatibility"""
+        if self.options.startdepth < 0:
+            self.options.startdepth = 0
+            inkex.errormsg("Warning: startdepth cannot be negative, set to 0")
+        
+        if self.options.maxdepth < 0:
+            self.options.maxdepth = 65535
+            inkex.errormsg("Warning: maxdepth cannot be negative, set to 65535")
+        
+        if self.options.keepdepth < 0:
+            self.options.keepdepth = 0
+            inkex.errormsg("Warning: keepdepth cannot be negative, set to 0")
+            
+        if self.options.startdepth > self.options.maxdepth:
+            inkex.errormsg("Warning: startdepth is greater than maxdepth, no ungrouping will occur")
+
     def _merge_transform(self, node, transform):
         """Propagate transform to remove inheritance"""
-        # Handle SVG viewBox transformation
-        if node.tag.endswith('}svg') and node.get("viewBox"):
-            try:
-                vx, vy, vw, vh = [float(x) for x in node.get("viewBox").split()]
-                dw = float(node.get("width", vw))
-                dh = float(node.get("height", vh))
-                viewbox_transform = Transform(
-                    f"translate({-vx}, {-vy}) scale({dw / vw}, {dh / vh})")
-                this_transform = viewbox_transform @ Transform(transform)
-                this_transform = this_transform @ Transform(node.get("transform"))
-                del node.attrib["viewBox"]
-            except (ValueError, TypeError):
+        try:
+            # Handle SVG viewBox transformation
+            if node.tag.endswith('}svg') and node.get("viewBox"):
+                try:
+                    vx, vy, vw, vh = [float(x) for x in node.get("viewBox").split()]
+                    dw = float(node.get("width", vw))
+                    dh = float(node.get("height", vh))
+                    viewbox_transform = Transform(
+                        f"translate({-vx}, {-vy}) scale({dw / vw}, {dh / vh})")
+                    this_transform = viewbox_transform @ Transform(transform)
+                    this_transform = this_transform @ Transform(node.get("transform"))
+                    del node.attrib["viewBox"]
+                except (ValueError, TypeError, ZeroDivisionError):
+                    this_transform = Transform(transform) @ Transform(node.get("transform"))
+            else:
                 this_transform = Transform(transform) @ Transform(node.get("transform"))
-        else:
-            this_transform = Transform(transform) @ Transform(node.get("transform"))
 
-        # Set the node's transform - only set if it's not empty or identity
-        transform_str = str(this_transform)
-        if transform_str and transform_str != "translate(0,0)" and transform_str != "matrix(1,0,0,1,0,0)":
-            node.set("transform", transform_str)
-        else:
-            node.pop("transform", None)
+            # Set the node's transform - only set if it's not empty or identity
+            transform_str = str(this_transform)
+            if transform_str and transform_str != "translate(0,0)" and transform_str != "matrix(1,0,0,1,0,0)":
+                node.set("transform", transform_str)
+            else:
+                node.pop("transform", None)
+        except Exception as e:
+            # Fallback: apply transform directly without modification
+            # Only log in headless mode or when debugging
+            if transform and str(transform) != "translate(0,0)" and str(transform) != "matrix(1,0,0,1,0,0)":
+                existing_transform = node.get("transform", "")
+                if existing_transform:
+                    node.set("transform", f"{transform} {existing_transform}")
+                else:
+                    node.set("transform", str(transform))
 
     def _merge_style(self, node, parent_style):
         """Propagate style to remove inheritance"""
-        # Parse current style
-        current_style = Style(node.get("style", ""))
-        
-        # Attributes that should not be propagated
-        non_propagated = ["filter", "mask", "clip-path"]
-        remaining_style = Style()
-        
-        # Separate non-propagated attributes
-        for key in non_propagated:
-            if key in current_style:
-                remaining_style[key] = current_style[key]
-                del current_style[key]
+        try:
+            # Parse current node's style
+            current_style = Style(node.get("style", ""))
+            
+            # Convert node's XML style attributes to style properties and remove them
+            inheritable_xml_attrs = ["fill", "stroke", "opacity", "stroke-width", "stroke-dasharray", 
+                                   "stroke-linecap", "stroke-linejoin", "fill-opacity", "stroke-opacity",
+                                   "font-family", "font-size", "font-weight", "font-style"]
+            
+            for attr in inheritable_xml_attrs:
+                if node.get(attr):
+                    # Node's own XML attribute takes precedence over everything
+                    current_style[attr] = node.get(attr)
+                    node.pop(attr, None)
+            
+            # Attributes that should not be propagated to children (remain local)
+            non_propagated = ["filter", "mask", "clip-path"]
+            local_style = Style()
+            
+            # Separate non-propagated attributes
+            for key in non_propagated:
+                if key in current_style:
+                    local_style[key] = current_style[key]
+                    del current_style[key]
 
-        # Create merged style
-        merged_style = Style(parent_style)
-        merged_style.update(current_style)
+            # Create merged style: parent styles + node's own styles (node takes precedence)
+            merged_style = Style(parent_style) if parent_style else Style()
+            merged_style.update(current_style)
+            
+            # Add back the non-propagated local styles
+            merged_style.update(local_style)
 
-        # Handle style attributes that might be XML attributes
-        style_attrs = ["fill", "stroke", "opacity"]
-        for attr in style_attrs:
-            if node.get(attr):
-                merged_style[attr] = node.get(attr)
-                node.pop(attr, None)
-
-        # Apply styles based on element type
-        tag = node.tag
-        if (tag.endswith('}g') or tag.endswith('}a') or tag.endswith('}switch')):
-            # Container elements: keep only non-propagated styles
-            if remaining_style:
-                node.style = remaining_style
-            else:
-                node.pop("style", None)
-        else:
-            # Leaf elements: apply merged style
-            merged_style.update(remaining_style)
+            # Apply the final style to the node
             if merged_style:
                 node.style = merged_style
             else:
                 node.pop("style", None)
+                    
+        except Exception as e:
+            # Fallback: preserve existing styles
+            # Keep existing style as-is to avoid breaking the element
+            pass
 
     def _merge_clippath(self, node, parent_clippath_url):
         """Handle clip-path inheritance"""
         if not parent_clippath_url:
             return
 
-        node_transform = Transform(node.get("transform"))
-        
-        # Check if transform is not identity (check for meaningful transforms)
-        transform_str = str(node_transform)
-        if transform_str and transform_str != "translate(0,0)" and transform_str != "matrix(1,0,0,1,0,0)":
-            # Create new clipPath with inverse transform
-            inverse_transform = -node_transform
+        try:
+            node_transform = Transform(node.get("transform"))
             
-            # Create clipPath element manually
-            new_clippath = inkex.etree.SubElement(
-                self.svg.defs, 'clipPath',
-                {'clipPathUnits': 'userSpaceOnUse',
-                 'id': self.svg.get_unique_id("clipPath")})
-            
-            # Find original clippath
-            original_clippath_id = parent_clippath_url[5:-1]  # Remove "url(#" and ")"
-            original_clippath = self.svg.getElementById(original_clippath_id)
-            
-            if original_clippath is not None:
-                # Reference original clippath elements with inverse transform
-                for child in original_clippath:
-                    use_elem = inkex.etree.SubElement(
-                        new_clippath, 'use',
-                        {'href': f"#{child.get('id')}", 
-                         'transform': str(inverse_transform),
-                         'id': self.svg.get_unique_id("use")})
+            # Check if transform is not identity (check for meaningful transforms)
+            transform_str = str(node_transform)
+            if transform_str and transform_str != "translate(0,0)" and transform_str != "matrix(1,0,0,1,0,0)":
+                # Create new clipPath with inverse transform
+                inverse_transform = -node_transform
                 
-                parent_clippath_url = f"url(#{new_clippath.get('id')})"
+                # Ensure defs element exists
+                if self.svg.defs is None:
+                    self.svg.defs = inkex.etree.SubElement(self.svg, 'defs')
+                
+                # Create clipPath element manually
+                new_clippath = inkex.etree.SubElement(
+                    self.svg.defs, 'clipPath',
+                    {'clipPathUnits': 'userSpaceOnUse',
+                     'id': self.svg.get_unique_id("clipPath")})
+                
+                # Find original clippath
+                original_clippath_id = parent_clippath_url[5:-1]  # Remove "url(#" and ")"
+                original_clippath = self.svg.getElementById(original_clippath_id)
+                
+                if original_clippath is not None:
+                    # Reference original clippath elements with inverse transform
+                    for child in original_clippath:
+                        if child.get('id'):  # Only process children with IDs
+                            use_elem = inkex.etree.SubElement(
+                                new_clippath, 'use',
+                            {'href': f"#{child.get('id')}", 
+                             'transform': str(inverse_transform),
+                             'id': self.svg.get_unique_id("use")})
+                    
+                    parent_clippath_url = f"url(#{new_clippath.get('id')})"
 
-        # Apply clip-path to node or chain it if node already has one
-        current_clippath = node.get("clip-path")
-        if current_clippath:
-            # Find the end of the clip-path chain
-            clippath_element = self.svg.getElementById(current_clippath[5:-1])
-            while clippath_element is not None and clippath_element.get("clip-path"):
-                next_clippath_url = clippath_element.get("clip-path")
-                clippath_element = self.svg.getElementById(next_clippath_url[5:-1])
-            
-            if clippath_element is not None:
-                clippath_element.set("clip-path", parent_clippath_url)
-        else:
-            node.set("clip-path", parent_clippath_url)
+            # Apply clip-path to node or chain it if node already has one
+            current_clippath = node.get("clip-path")
+            if current_clippath:
+                # Find the end of the clip-path chain
+                clippath_element = self.svg.getElementById(current_clippath[5:-1])
+                while clippath_element is not None and clippath_element.get("clip-path"):
+                    next_clippath_url = clippath_element.get("clip-path")
+                    clippath_element = self.svg.getElementById(next_clippath_url[5:-1])
+                
+                if clippath_element is not None:
+                    clippath_element.set("clip-path", parent_clippath_url)
+            else:
+                node.set("clip-path", parent_clippath_url)
+        except Exception as e:
+            # Fallback: apply clip-path directly
+            if not node.get("clip-path"):
+                node.set("clip-path", parent_clippath_url)
 
     def _ungroup(self, group_node):
         """Flatten a group into the same z-order as its parent"""
-        parent = group_node.getparent()
-        if parent is None:
-            return
+        try:
+            parent = group_node.getparent()
+            if parent is None:
+                return
 
-        parent_index = list(parent).index(group_node)
-        group_style = Style(group_node.get("style", ""))
-        group_transform = Transform(group_node.get("transform"))
-        group_clippath = group_node.get("clip-path")
+            parent_index = list(parent).index(group_node)
+            
+            # Collect group style including XML attributes that should be inherited
+            group_style = Style(group_node.get("style", ""))
+            
+            # Add inheritable XML attributes to the style
+            inheritable_attrs = ["fill", "stroke", "opacity", "stroke-width", "stroke-dasharray", 
+                               "stroke-linecap", "stroke-linejoin", "fill-opacity", "stroke-opacity",
+                               "font-family", "font-size", "font-weight", "font-style"]
+            
+            for attr in inheritable_attrs:
+                attr_value = group_node.get(attr)
+                if attr_value and attr not in group_style:
+                    group_style[attr] = attr_value
+            
+            group_transform = Transform(group_node.get("transform"))
+            group_clippath = group_node.get("clip-path")
 
-        # Process children in reverse order to maintain z-order
-        children = list(group_node)
-        for child in reversed(children):
-            self._merge_transform(child, group_transform)
-            self._merge_style(child, group_style)
-            self._merge_clippath(child, group_clippath)
-            parent.insert(parent_index, child)
+            # Process children in reverse order to maintain z-order
+            children = list(group_node)
+            for child in reversed(children):
+                try:
+                    self._merge_transform(child, group_transform)
+                    self._merge_style(child, group_style)
+                    self._merge_clippath(child, group_clippath)
+                    parent.insert(parent_index, child)
+                except Exception as e:
+                    # Still try to move the child to preserve structure
+                    try:
+                        parent.insert(parent_index, child)
+                    except:
+                        pass
 
-        # Remove the now-empty group
-        parent.remove(group_node)
+            # Remove the now-empty group
+            parent.remove(group_node)
+        except Exception as e:
+            # Log only critical ungroup failures
+            inkex.errormsg(f"Failed to ungroup {group_node.get('id', 'unknown')}: {e}")
 
     def _should_ungroup(self, node, depth, height):
         """Determine if a node should be ungrouped based on criteria"""
         return (node.tag.endswith('}g') and  # SVG group element
                 node.getparent() is not None and
-                height > self.options.keepdepth and
+                height >= self.options.keepdepth and
                 depth >= self.options.startdepth and
                 depth <= self.options.maxdepth)
 
@@ -217,15 +283,37 @@ class DeepUngroup(inkex.EffectExtension):
 
     def effect(self):
         """Main effect method"""
-        if self.svg.selected:
-            # Process selected elements
-            for element in self.svg.selected.values():
-                self._deep_ungroup(element)
-        else:
-            # Process entire document - self.svg IS the root element
-            for element in self.svg:
-                self._deep_ungroup(element)
+        try:
+            # Validate arguments first
+            self._validate_arguments()
+            
+            if self.svg.selected:
+                # Process selected elements
+                for element_id, element in self.svg.selected.items():
+                    try:
+                        self._deep_ungroup(element)
+                    except Exception as e:
+                        inkex.errormsg(f"Error processing selected element {element_id}: {e}")
+            else:
+                # Process entire document - self.svg IS the root element
+                root_children = list(self.svg)
+                for element in root_children:
+                    try:
+                        self._deep_ungroup(element)
+                    except Exception as e:
+                        inkex.errormsg(f"Error processing document element {element.get('id', 'unknown')}: {e}")
+            
+        except Exception as e:
+            inkex.errormsg(f"Deep Ungroup: Critical error in main effect: {e}")
+            # Re-raise to ensure Inkscape knows the extension failed
+            raise
 
 
 if __name__ == '__main__':
-    DeepUngroup().run()
+    try:
+        DeepUngroup().run()
+    except Exception as e:
+        # Final fallback for headless mode
+        print(f"Deep Ungroup Extension Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
